@@ -1,15 +1,24 @@
-# app.py — VA Empire Tracker (Pro-Pro) with Account Creation + Per-User Private Data
-# - Create account / Log in / Log out
-# - Each user gets their own SQLite DB: data/user_<id>.db
-# - Each user gets their own receipts folder: uploads/user_<id>/
-# - WAL + busy_timeout + retry-on-locked to reduce SQLite lock errors
+# app.py — VA Empire Tracker (Pro-Pro) + Accounts + Per-User Private Data (Cloud-Safe)
 #
-# Requirements (requirements.txt):
+# Features:
+# - Create account / Login / Logout (passlib CryptContext)
+# - Per-user SQLite DB: data/user_<id>.db
+# - Per-user receipts folder: uploads/user_<id>/
+# - Properties + Loans + Rentals
+# - Tenants & Leases + Delete Tenant
+# - Ledger & Receipts
+# - Vacancy Tracker
+# - Reports (Rent Roll + Tax)
+# - Net Worth Timeline (Upgraded)
+# - Backup & Restore (per-user)
+# - Exports + Settings
+#
+# requirements.txt:
 # streamlit
 # pandas
 # numpy
 # python-dateutil
-# bcrypt
+# passlib[bcrypt]
 
 import os
 import io
@@ -19,13 +28,13 @@ import sqlite3
 import zipfile
 from datetime import date, datetime
 
-import CryptContext
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
+from passlib.context import CryptContext
 
-APP_TITLE = "VA Empire Tracker — Pro-Pro"
+APP_TITLE = "VA Empire Tracker — Pro-Pro (Accounts + Private Data)"
 AUTH_DB_PATH = "auth.db"
 DATA_DIR = "data"
 UPLOADS_BASE_DIR = "uploads"
@@ -36,9 +45,11 @@ DB_CONNECT_TIMEOUT_S = 10
 DB_WRITE_RETRIES = 10
 DB_WRITE_RETRY_SLEEP_S = 0.25
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 
 # ============================
-# Low-level SQLite helpers
+# SQLite helpers
 # ============================
 def _exec_with_retry(cur, sql, params=()):
     last_err = None
@@ -55,7 +66,7 @@ def _exec_with_retry(cur, sql, params=()):
     raise last_err
 
 
-def _apply_sqlite_pragmas(cur):
+def _apply_pragmas(cur):
     cur.execute("PRAGMA foreign_keys = ON;")
     cur.execute("PRAGMA journal_mode = WAL;")
     cur.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS};")
@@ -68,7 +79,7 @@ def _apply_sqlite_pragmas(cur):
 def auth_db():
     conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False, timeout=DB_CONNECT_TIMEOUT_S)
     cur = conn.cursor()
-    _apply_sqlite_pragmas(cur)
+    _apply_pragmas(cur)
     return conn
 
 
@@ -81,7 +92,7 @@ def init_auth_db():
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL UNIQUE,
-                pw_hash BLOB NOT NULL,
+                pw_hash TEXT NOT NULL,
                 created_at TEXT DEFAULT ''
             );
             """
@@ -98,7 +109,7 @@ def create_user(email: str, password: str):
     if not password or len(password) < 8:
         raise ValueError("Password must be at least 8 characters.")
 
-    pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    pw_hash = pwd_context.hash(password)
 
     conn = auth_db()
     cur = conn.cursor()
@@ -125,7 +136,7 @@ def verify_user(email: str, password: str):
         if not row:
             return None
         uid, pw_hash = int(row[0]), row[1]
-        if bcrypt.checkpw(password.encode("utf-8"), pw_hash):
+        if pwd_context.verify(password, pw_hash):
             return uid
         return None
     finally:
@@ -148,7 +159,7 @@ def user_upload_dir(user_id: int) -> str:
 
 
 # ============================
-# Main App DB (per-user)
+# Per-user main DB
 # ============================
 def db():
     if "user_id" not in st.session_state or not st.session_state.user_id:
@@ -156,7 +167,7 @@ def db():
     path = user_db_path(st.session_state.user_id)
     conn = sqlite3.connect(path, check_same_thread=False, timeout=DB_CONNECT_TIMEOUT_S)
     cur = conn.cursor()
-    _apply_sqlite_pragmas(cur)
+    _apply_pragmas(cur)
     return conn
 
 
@@ -335,7 +346,7 @@ def init_db_and_migrate():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 property_id INTEGER NOT NULL,
                 tx_date TEXT NOT NULL,
-                tx_type TEXT NOT NULL,      -- INCOME / EXPENSE
+                tx_type TEXT NOT NULL,
                 category TEXT NOT NULL,
                 amount REAL NOT NULL,
                 memo TEXT DEFAULT '',
@@ -395,7 +406,7 @@ def init_db_and_migrate():
 
 
 # ============================
-# Safe deletes
+# Safe deletes (avoid FK fails)
 # ============================
 def safe_delete_property(property_id: int):
     conn = db()
@@ -404,7 +415,10 @@ def safe_delete_property(property_id: int):
         cur.execute("BEGIN;")
         _exec_with_retry(
             cur,
-            "DELETE FROM attachments WHERE transaction_id IN (SELECT id FROM transactions WHERE property_id = ?)",
+            """
+            DELETE FROM attachments
+            WHERE transaction_id IN (SELECT id FROM transactions WHERE property_id = ?)
+            """,
             (property_id,),
         )
         _exec_with_retry(cur, "DELETE FROM transactions WHERE property_id = ?", (property_id,))
@@ -430,7 +444,7 @@ def safe_delete_tenant(tenant_id: int, delete_leases: bool = False):
         lease_count = int(cur.fetchone()[0] or 0)
 
         if lease_count > 0 and not delete_leases:
-            raise ValueError(f"Tenant has {lease_count} lease(s). Check 'Delete tenant leases too' to proceed.")
+            raise ValueError(f"Tenant has {lease_count} lease(s). Enable 'Delete tenant leases too' to proceed.")
 
         if lease_count > 0 and delete_leases:
             _exec_with_retry(cur, "DELETE FROM leases WHERE tenant_id = ?", (tenant_id,))
@@ -569,7 +583,7 @@ def compute_required_reserves(props_df, loans_df, rentals_df, reserve_months_tar
 
 
 # ============================
-# Net Worth Timeline (Upgraded)
+# Upgraded Net Worth Timeline
 # ============================
 def debt_path_with_snowball(
     loans_df: pd.DataFrame,
@@ -734,14 +748,11 @@ def safe_restore_from_zip(zip_bytes: bytes, user_db: str, user_uploads: str):
     if not os.path.exists(extracted_db):
         raise ValueError("Backup ZIP missing user.db")
 
-    # Replace DB
     os.makedirs(os.path.dirname(user_db), exist_ok=True)
     if os.path.exists(user_db):
         os.replace(user_db, user_db + ".bak")
     os.replace(extracted_db, user_db)
 
-    # Replace uploads
-    os.makedirs(user_uploads, exist_ok=True)
     if os.path.exists(user_uploads):
         shutil.rmtree(user_uploads)
     if os.path.isdir(extracted_uploads):
@@ -753,7 +764,7 @@ def safe_restore_from_zip(zip_bytes: bytes, user_db: str, user_uploads: str):
 
 
 # ============================
-# Small UI helpers
+# UI helpers
 # ============================
 def parse_iso_date(s: str):
     try:
@@ -871,7 +882,7 @@ def prop_label(pid: int) -> str:
 # Main UI
 # ============================
 st.title(APP_TITLE)
-st.caption("Private per-user data (accounts) • SQLite WAL lock fixes • Pro-Pro features")
+st.caption("Accounts + Private Data • SQLite WAL lock fixes • Pro-Pro features")
 
 page = st.sidebar.radio(
     "Navigate",
@@ -891,17 +902,19 @@ page = st.sidebar.radio(
     ],
 )
 
+
 # ============================
-# Pages
+# Empire Dashboard
 # ============================
 if page == "Empire Dashboard":
     c1, c2, c3, c4 = st.columns(4)
+
     total_balance = float(loans["current_balance"].sum()) if not loans.empty else 0.0
     total_props = int(len(props))
 
     total_value = float(props["est_value"].fillna(0).sum()) if not props.empty else 0.0
-    if total_value <= 0:
-        total_value = float(props["purchase_price"].fillna(0).sum()) if not props.empty else 0.0
+    if total_value <= 0 and not props.empty:
+        total_value = float(props["purchase_price"].fillna(0).sum())
 
     equity_est = max(total_value - total_balance, 0.0) if total_value > 0 else 0.0
 
@@ -920,6 +933,7 @@ if page == "Empire Dashboard":
     c4.metric("Est. Equity", f"${equity_est:,.0f}")
 
     st.divider()
+
     st.subheader("Reminders")
     days = st.slider("Show leases expiring within (days)", 7, 180, 45, 1)
     expiring_rows = []
@@ -959,6 +973,9 @@ if page == "Empire Dashboard":
         st.dataframe(txs.head(20), use_container_width=True)
 
 
+# ============================
+# Properties
+# ============================
 elif page == "Properties (Add / Edit / Delete / Move→Rent)":
     st.subheader("Add a Property")
     with st.form("add_property"):
@@ -1064,6 +1081,9 @@ elif page == "Properties (Add / Edit / Delete / Move→Rent)":
                         st.error(f"Delete failed: {e}")
 
 
+# ============================
+# Loans
+# ============================
 elif page == "Loans":
     st.subheader("Add a Loan")
     if props.empty:
@@ -1113,6 +1133,9 @@ elif page == "Loans":
         st.dataframe(loans, use_container_width=True)
 
 
+# ============================
+# Rentals
+# ============================
 elif page == "Rentals":
     st.subheader("Rental Settings")
     if props.empty:
@@ -1192,6 +1215,9 @@ elif page == "Rentals":
             c4.metric("Cashflow (Monthly)", f"${m['Cashflow_Monthly']:,.0f}")
 
 
+# ============================
+# Tenants & Leases
+# ============================
 elif page == "Tenants & Leases (Pro)":
     st.subheader("Tenants")
 
@@ -1278,6 +1304,9 @@ elif page == "Tenants & Leases (Pro)":
         st.dataframe(leases, use_container_width=True)
 
 
+# ============================
+# Ledger & Receipts
+# ============================
 elif page == "Ledger & Receipts (Pro)":
     st.subheader("Add Transaction")
     if props.empty:
@@ -1377,6 +1406,9 @@ elif page == "Ledger & Receipts (Pro)":
             st.caption("Receipts are stored per-user in uploads/user_<id>/.")
 
 
+# ============================
+# Vacancy Tracker
+# ============================
 elif page == "Vacancy Tracker (Pro-Pro)":
     st.subheader("Vacancy Tracker")
     st.caption("Log vacancy periods. Helpful for real cashflow + year-end reporting.")
@@ -1411,6 +1443,9 @@ elif page == "Vacancy Tracker (Pro-Pro)":
         st.dataframe(v[["id", "property_name", "start_date", "end_date", "notes"]], use_container_width=True)
 
 
+# ============================
+# Reports
+# ============================
 elif page == "Reports (Rent Roll + Tax) (Pro-Pro)":
     st.subheader("Rent Roll (Active Leases)")
     if leases.empty:
@@ -1494,8 +1529,12 @@ elif page == "Reports (Rent Roll + Tax) (Pro-Pro)":
             df_download_button(by_prop_bucket, f"tax_report_{year}_by_property.csv", "Download tax_report_by_property.csv")
 
 
+# ============================
+# Net Worth Timeline
+# ============================
 elif page == "Net Worth Timeline (Upgraded)":
     st.subheader("Net Worth Timeline (Portfolio Value − Debt) — Upgraded")
+
     if props.empty:
         st.info("Add properties first.")
     else:
@@ -1573,6 +1612,9 @@ elif page == "Net Worth Timeline (Upgraded)":
         df_download_button(proj, "net_worth_timeline.csv", "Download net_worth_timeline.csv")
 
 
+# ============================
+# Backup & Restore
+# ============================
 elif page == "Backup & Restore (Pro-Pro)":
     st.subheader("Backup & Restore (Your Account Only)")
     st.caption("Backup includes your private user DB + your receipts folder only.")
@@ -1605,6 +1647,9 @@ elif page == "Backup & Restore (Pro-Pro)":
                 st.error(f"Restore failed: {e}")
 
 
+# ============================
+# Exports
+# ============================
 elif page == "Exports":
     st.subheader("Export Data to CSV (Your Account)")
     df_download_button(props, "properties.csv", "Download properties.csv")
@@ -1617,6 +1662,9 @@ elif page == "Exports":
     df_download_button(attachments, "attachments.csv", "Download attachments.csv")
 
 
+# ============================
+# Settings
+# ============================
 elif page == "Settings":
     st.subheader("Settings")
 
